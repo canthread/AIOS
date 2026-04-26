@@ -1,0 +1,13 @@
+# AIOS — Homelab Orchestrator
+# Install with: pip install -r requirements.txt
+
+# Docker socket crawler
+docker
+
+# LlamaIndex core + integrations
+llama-index
+llama-index-vector-stores-chroma
+llama-index-embeddings-ollama
+
+# Vector store
+chromadb

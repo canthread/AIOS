@@ -1,0 +1,9 @@
+chroma_data/*
+!chroma_data/.gitkeep
+
+docker_state.json
+
+__pycache__/
+*.pyc
+.env
+venv/
