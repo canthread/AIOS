@@ -13,11 +13,13 @@ retriever will read it back like a filesystem lookup.
 """
 
 import chromadb
-from llama_index.core import VectorStoreIndex, StorageContext, Document
+from llama_index.core import VectorStoreIndex, StorageContext, Document, Settings
+from llama_index.core.node_parser import SimpleNodeParser
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.embeddings.ollama import OllamaEmbedding
 
-from crawler import DockerCrawler
+from docker_crawler import DockerCrawler
+from config_crawler import ConfigCrawler
 
 
 # ---------------------------------------------------------------------------
@@ -86,9 +88,50 @@ def build_documents(crawler_results: dict) -> list[Document]:
     return documents
 
 
-# ---------------------------------------------------------------------------
-# Embedder
-# ---------------------------------------------------------------------------
+def build_config_documents(config_results: dict) -> list[Document]:
+    """
+    Convert config crawler output into LlamaIndex Document objects.
+    Kept separate from build_documents so the two sources can be
+    ingested independently or together.
+    """
+    documents = []
+
+    for svc in config_results["services"]:
+        documents.append(Document(
+            text=svc.to_text(),
+            metadata={
+                "type": "compose_service",
+                "stack": svc.stack_name,
+                "service": svc.service_name,
+                "image": svc.image or "",
+                "source": svc.source_file,
+            }
+        ))
+
+    for net in config_results["networks"]:
+        documents.append(Document(
+            text=net.to_text(),
+            metadata={
+                "type": "compose_network",
+                "stack": net.stack_name,
+                "network": net.network_name,
+                "external": str(net.external),
+                "source": net.source_file,
+            }
+        ))
+
+    for cfg in config_results["configs"]:
+        documents.append(Document(
+            text=cfg.to_text(),
+            metadata={
+                "type": "config_file",
+                "stack": cfg.stack_name,
+                "filename": cfg.filename,
+                "source": cfg.source_file,
+            }
+        ))
+
+    return documents
 
 class Embedder:
     """
@@ -131,19 +174,31 @@ class Embedder:
         """
         Embed a list of LlamaIndex Documents and store them in ChromaDB.
 
-        VectorStoreIndex.from_documents() handles:
-          1. Chunking each document (splitting long text into overlapping chunks)
-          2. Calling the embedding model on each chunk
-          3. Writing the vectors + original text + metadata to ChromaDB
+        chunk_size=2048 is intentionally large — our documents are short
+        (one container/network/volume per doc). We want each document to
+        stay as a single chunk, not get split into duplicates.
 
-        Returns the index object, which you can use immediately for retrieval.
+        chunk_overlap=0 for the same reason — no overlap needed when each
+        document is already a single atomic unit of information.
         """
         print(f"[embedder] Embedding {len(documents)} documents...")
+
+        # Disable the default LLM — we don't need it for embedding or retrieval.
+        # Without this LlamaIndex tries to call OpenAI.
+        Settings.llm = None
+
+        # Large chunk size prevents our short documents from being split
+        # into multiple redundant chunks.
+        parser = SimpleNodeParser.from_defaults(
+            chunk_size=2048,
+            chunk_overlap=0,
+        )
 
         index = VectorStoreIndex.from_documents(
             documents,
             storage_context=self.storage_context,
             embed_model=self.embed_model,
+            transformations=[parser],
             show_progress=True,
         )
 
@@ -191,17 +246,18 @@ def retrieval_test(index: VectorStoreIndex, embed_model: OllamaEmbedding):
     planning layer.
     """
     test_queries = [
-        "what port is Radarr on",
-        "which containers are on the mediastack network",
-        "what volumes does Jellyfin use",
-        "what is the subnet of the mediastack network",
-        ]
-    # as_retriever does pure vector similarity — no LLM involved.
-    # as_query_engine synthesizes an answer via LLM (defaults to OpenAI).
-    retriever = index.as_retriever(
-            embed_model=embed_model,
-            similarity_top_k=3,
-            )
+        "what port is traefik on",
+        "which containers are on the n8n-compose network",
+        "what volumes does n8n use",
+        "what is the subnet of the searxng network",
+    ]
+
+    # query_engine handles: embed the query → similarity search → return chunks
+    query_engine = index.as_query_engine(
+        embed_model=embed_model,
+        similarity_top_k=3,    # return top 3 most similar chunks
+        response_mode="no_text",  # return raw chunks, not an LLM-generated answer
+    )
 
     print("\n" + "=" * 60)
     print("RETRIEVAL TEST")
@@ -210,7 +266,7 @@ def retrieval_test(index: VectorStoreIndex, embed_model: OllamaEmbedding):
     for query in test_queries:
         print(f"\nQuery: {query}")
         print("-" * 40)
-        response = retriever.retrieve(query)
+        response = query_engine.retrieve(query)
         for i, node in enumerate(response):
             print(f"Result {i+1} (score: {node.score:.4f}):")
             print(node.text)
@@ -225,28 +281,33 @@ def retrieval_test(index: VectorStoreIndex, embed_model: OllamaEmbedding):
 if __name__ == "__main__":
     import sys
 
-    # 1. Crawl current Docker state
-    print("[crawler] Reading Docker socket...")
-    crawler = DockerCrawler()
+    # 1. Crawl Docker socket state (what IS running)
+    print("[docker_crawler] Reading Docker socket...")
+    docker_crawler = DockerCrawler()
     try:
-        results = crawler.crawl_all()
-        print(f"[crawler] Found {len(results['containers'])} containers, "
-              f"{len(results['networks'])} networks, "
-              f"{len(results['volumes'])} volumes.")
+        docker_results = docker_crawler.crawl_all()
+        print(f"[docker_crawler] Found {len(docker_results['containers'])} containers, "
+              f"{len(docker_results['networks'])} networks, "
+              f"{len(docker_results['volumes'])} volumes.")
     finally:
-        crawler.close()
+        docker_crawler.close()
 
-    # 2. Build LlamaIndex documents
-    documents = build_documents(results)
-    print(f"[embedder] Built {len(documents)} documents.")
+    # 2. Crawl config files (what SHOULD be running)
+    print("\n[config_crawler] Reading ~/docker/...")
+    config_crawler = ConfigCrawler()
+    config_results = config_crawler.crawl()
+    print(f"[config_crawler] Found {len(config_results['services'])} services, "
+          f"{len(config_results['networks'])} networks, "
+          f"{len(config_results['configs'])} config files.")
 
-    # 3. Embed into ChromaDB
+    # 3. Build LlamaIndex documents from both sources
+    documents = build_documents(docker_results) + build_config_documents(config_results)
+    print(f"\n[embedder] Total documents to embed: {len(documents)}")
+
+    # 4. Embed into ChromaDB (wipe first for clean re-ingestion)
     embedder = Embedder()
-
-    # Wipe first if you want a clean re-ingestion
-    # embedder.wipe_collection()
-
+    embedder.wipe_collection()
     index = embedder.embed(documents)
 
-    # 4. Run retrieval test
+    # 5. Run retrieval test
     retrieval_test(index, embedder.embed_model)

@@ -4,6 +4,13 @@
 # Docker socket crawler
 docker
 
+# Config file crawler
+pyyaml
+
+# Planning layer
+requests
+python-dotenv
+
 # LlamaIndex core + integrations
 llama-index
 llama-index-vector-stores-chroma
